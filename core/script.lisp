@@ -21,10 +21,49 @@
 
 
 ;;;-----------------------------------------------------------------------------
-;;; Script parsing and serialization
+;;; Script representation
 
 (defstruct script
   commands)
+
+;;; Script's COMMANDS slot is an array of commands, each of which is either
+;;;   - an integer for a simple command,
+;;;   - a cons (<op> . <payload>) for a data push command,
+;;;   - a cons 
+
+(defun simple-command-p (command)
+  (not (consp command)))
+
+(defun command-push-p (command)
+  (and (consp command) (not (consp (car command)))))
+
+(defun command-pushdata-p (command)
+  (and (consp command) (consp (car command))))
+
+(defun command-op (command)
+  (if (consp command)
+      (car command)
+      command))
+
+(defun command-payload (command)
+  (if (consp command)
+      (cdr command)
+      nil))
+
+(defun command-number (command)
+  "If a given script command is a simple integer data push command, return
+the corresponding integer, otherwise return `nil`."
+  (let ((code (command-op command)))
+    (cond ((= code 0)
+           0)
+          ((<= 81 code 96)
+           (- code 80))
+          (t
+           nil))))
+
+
+;;;-----------------------------------------------------------------------------
+;;; Opcode mappings
 
 (defvar *opcodes-by-code* (make-hash-table)
   "Table mapping opcodes to pairs (<list of opcode-names> . <function>).")
@@ -90,35 +129,12 @@ otherwise."
         bytes)
       #()))
 
-(defun command-op (command)
-  (if (consp command)
-      (car command)
-      command))
-
-(defun command-number (command)
-  (let ((code (command-op command)))
-    (cond ((= code 0)
-           0)
-          ((<= 81 code 96)
-           (- code 80))
-          (t
-           nil))))
-
-(defun command-payload (command)
-  (if (consp command)
-      (cdr command)
-      nil))
-
 (defmethod serialize ((script script) stream)
   (let* ((commands (script-commands script))
          (script-bytes
           (ironclad:with-octet-output-stream (script-stream)
             (loop
                :for op :across commands
-               :if (and (consp op) (eq (car op) :unexpected_end))
-               :do
-                 (write-bytes (cdr op) script-stream (length (cdr op)))
-               :else
                :if (and (consp op) (<= (opcode :op_push1) (car op) (opcode :op_push75)))
                :do
                  (write-byte (car op) script-stream)
@@ -154,7 +170,7 @@ otherwise."
                   (read-size (min expected-read-size (- script-len i 1))))
              (if unexpected-end-p
                  (ironclad:with-octet-input-stream (script-stream script-bytes i) ;; hacky way to seek
-                   (push (cons :unexpected_end (read-bytes script-stream (1+ read-size))) commands))
+                   (push (cons op (read-bytes script-stream (1+ read-size))) commands))
                  (push (cons op (read-bytes script-stream read-size)) commands))
              (incf i (+ 1 read-size)))
          :else
@@ -167,13 +183,13 @@ otherwise."
                   (int-size (min expected-int-size (- script-len i 1))))
              (if unexpected-end-p
                  (ironclad:with-octet-input-stream (script-stream script-bytes i) ;; hacky way to seek
-                   (push (cons :unexpected_end (read-bytes script-stream (1+ int-size))) commands))
+                   (push (cons op (read-bytes script-stream (1+ int-size))) commands))
                  (let* ((expected-read-size (read-int script-stream :size int-size :byte-order :little))
                         (unexpected-end-p (> (+ i 1 int-size expected-read-size) script-len))
                         (read-size (min expected-read-size (- script-len i 1 int-size))))
                    (if unexpected-end-p
                        (ironclad:with-octet-input-stream (script-stream script-bytes i) ;; hacky way to seek
-                         (push (cons :unexpected_end (read-bytes script-stream (+ 1 int-size read-size))) commands))
+                         (push (cons op (read-bytes script-stream (+ 1 int-size read-size))) commands))
                        (push (cons op (read-bytes script-stream read-size)) commands))
                    (incf i read-size)))
              (incf i (+ 1 int-size)))
@@ -188,15 +204,12 @@ otherwise."
 
 (defmethod print-object ((script script) stream)
   (flet ((print-command  (c)
-           (cond ((and (consp c) (eq (car c) :unexpected_end))
-                  (format nil "UNEXPECTED_END ~a" (hex-encode (cdr c))))
-                 ((consp c)
-                  (if *print-script-as-assembly*
-                      (format nil "~a" (hex-encode (cdr c)))
-                      (format nil "~{~:@(~a~)~^/~} ~a"
-                              (opcode (car c)) (hex-encode (cdr c)))))
-                 (t
-                  (format nil "~{~:@(~a~)~^/~}" (opcode c))))))
+           (if (consp c)
+               (if *print-script-as-assembly*
+                   (format nil "~a" (hex-encode (cdr c)))
+                   (format nil "~{~:@(~a~)~^/~} ~a"
+                           (opcode (car c)) (hex-encode (cdr c))))
+               (format nil "~{~:@(~a~)~^/~}" (opcode c)))))
     (let ((commands (map 'list #'print-command (script-commands script))))
       (if *print-script-as-assembly*
           (format stream "~{~a~^ ~}" commands)
